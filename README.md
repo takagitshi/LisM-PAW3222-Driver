@@ -90,6 +90,23 @@ endif
 - `irq-gpios`: GPIO connected to the motion pin (required)
 - `res-cpi`: CPI resolution for the sensor (optional)
 - `force-awake`: Initialize the sensor in "force awake" mode (optional, boolean)
+- `report-interval-ms`: Aggregate deltas and report at most once per interval
+  (optional, defaults to immediate reporting)
+
+## Motion sampling
+
+The driver reads both low-byte delta registers and `DELTA_XY_HI`, then reports
+signed 12-bit X/Y deltas. While the MOTION pin remains active it drains pending
+samples immediately instead of imposing a fixed polling delay. A capped 1--64 ms
+exponential retry is used only for a transient SPI failure or a GPIO/register race.
+
+For a split peripheral, set `report-interval-ms` to a small bounded value such
+as 8 ms. The sensor is still drained immediately, but accumulated deltas are
+sent as one X/Y frame per interval so a bounded split transport is not flooded.
+
+`force-awake` remains disabled by default because it trades lower wake latency
+for higher battery use. Enable it only when comparing first-motion wake latency
+on the target hardware.
 
 ---
 

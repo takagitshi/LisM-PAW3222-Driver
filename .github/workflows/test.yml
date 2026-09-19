@@ -1,0 +1,13 @@
+name: Test PAW3222 helpers
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  delta-decode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test signed 12-bit delta decoding
+        run: make test

@@ -33,3 +33,11 @@ properties:
       Initialize the sensor in "force awake" mode. This can also be enabled or
       disabled in runtime by the application using the paw32xx_force_awake()
       API.
+
+  report-interval-ms:
+    type: int
+    default: 0
+    description: |
+      Aggregate deltas and report them at most once per interval. Zero reports
+      every sample immediately. A small non-zero interval is useful on split
+      peripherals whose transport has bounded notification buffers.

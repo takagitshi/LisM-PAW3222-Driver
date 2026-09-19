@@ -19,9 +19,11 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/pm/device.h>
 #include <zephyr/pm/device_runtime.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/util.h>
 
 #include "../include/paw3222.h"
+#include "../include/paw3222_delta.h"
 
 LOG_MODULE_REGISTER(paw32xx, CONFIG_ZMK_LOG_LEVEL);
 
@@ -59,9 +61,9 @@ LOG_MODULE_REGISTER(paw32xx, CONFIG_ZMK_LOG_LEVEL);
 #define MOUSE_OPTION_MOVX_INV_BIT 3
 #define MOUSE_OPTION_MOVY_INV_BIT 4
 
-#define PAW32XX_DATA_SIZE_BITS 8
-
 #define RESET_DELAY_MS 2
+#define MOTION_RETRY_MIN_DELAY_MS 1
+#define MOTION_RETRY_MAX_DELAY_MS 64
 
 #define RES_STEP 38
 #define RES_MIN (16 * RES_STEP)
@@ -73,15 +75,22 @@ struct paw32xx_config {
     struct gpio_dt_spec power_gpio;
     int16_t res_cpi;
     bool force_awake;
+    uint32_t report_interval_ms;
 };
 
 struct paw32xx_data {
     const struct device *dev;
     struct k_work motion_work;
+    struct k_work_delayable report_work;
     struct gpio_callback motion_cb;
-    struct k_timer motion_timer; // Add timer for delayed motion checking
+    struct k_timer motion_retry_timer;
+    atomic_t suspended;
+    uint8_t retry_delay_ms;
+    int32_t pending_x;
+    int32_t pending_y;
 };
 
+#if DT_INST_NODE_HAS_PROP(0, power_gpios)
 static int paw32xx_force_cs(const struct device *dev, bool force_low) {
     const struct paw32xx_config *cfg = dev->config;
     const struct gpio_dt_spec *cs = NULL;
@@ -104,15 +113,7 @@ static int paw32xx_force_cs(const struct device *dev, bool force_low) {
 
     return 0;
 }
-
-// Define a custom sign_extend function to avoid conflict with Zephyr's implementation
-static inline int32_t _sign_extend(uint32_t value, uint8_t index) {
-    __ASSERT_NO_MSG(index <= 31);
-
-    uint8_t shift = 31 - index;
-
-    return (int32_t)(value << shift) >> shift;
-}
+#endif
 
 static int paw32xx_read_reg(const struct device *dev, uint8_t addr, uint8_t *value) {
     const struct paw32xx_config *cfg = dev->config;
@@ -191,6 +192,8 @@ static int paw32xx_read_xy(const struct device *dev, int16_t *x, int16_t *y) {
         0xff,
         PAW32XX_DELTA_Y,
         0xff,
+        PAW32XX_DELTA_XY_HI,
+        0xff,
     };
     uint8_t rx_data[sizeof(tx_data)];
 
@@ -217,11 +220,8 @@ static int paw32xx_read_xy(const struct device *dev, int16_t *x, int16_t *y) {
         return ret;
     }
 
-    *x = rx_data[1];
-    *y = rx_data[3];
-
-    *x = _sign_extend(*x, PAW32XX_DATA_SIZE_BITS - 1);
-    *y = _sign_extend(*y, PAW32XX_DATA_SIZE_BITS - 1);
+    *x = paw3222_decode_delta(rx_data[1], rx_data[5] >> 4);
+    *y = paw3222_decode_delta(rx_data[3], rx_data[5]);
 
     return 0;
 }
@@ -237,69 +237,151 @@ static int paw32xx_interrupt_configure(const struct device *dev, gpio_flags_t fl
 }
 
 static int paw32xx_interrupt_enable(const struct device *dev) {
-    return paw32xx_interrupt_configure(dev, GPIO_INT_LEVEL_ACTIVE);
+    return paw32xx_interrupt_configure(dev, GPIO_INT_EDGE_TO_ACTIVE);
 }
 
 static int paw32xx_interrupt_disable(const struct device *dev) {
     return paw32xx_interrupt_configure(dev, GPIO_INT_DISABLE);
 }
 
-static void paw32xx_motion_timer_handler(struct k_timer *timer) {
-    struct paw32xx_data *data = CONTAINER_OF(timer, struct paw32xx_data, motion_timer);
-    k_work_submit(&data->motion_work);
+static void paw32xx_motion_retry_timer_handler(struct k_timer *timer) {
+    struct paw32xx_data *data = CONTAINER_OF(timer, struct paw32xx_data, motion_retry_timer);
+
+    if (!atomic_get(&data->suspended)) {
+        k_work_submit(&data->motion_work);
+    }
+}
+
+static int paw32xx_motion_pin_get(struct paw32xx_data *data) {
+    const struct paw32xx_config *cfg = data->dev->config;
+    int motion = gpio_pin_get_dt(&cfg->irq_gpio);
+
+    if (motion < 0) {
+        LOG_ERR("Failed to read motion GPIO: %d", motion);
+    }
+
+    return motion;
+}
+
+static void paw32xx_retry_if_motion(struct paw32xx_data *data) {
+    int motion;
+    uint8_t delay_ms;
+
+    if (atomic_get(&data->suspended)) {
+        return;
+    }
+
+    motion = paw32xx_motion_pin_get(data);
+    if (motion <= 0) {
+        data->retry_delay_ms = MOTION_RETRY_MIN_DELAY_MS;
+        return;
+    }
+
+    delay_ms = data->retry_delay_ms;
+    k_timer_start(&data->motion_retry_timer, K_MSEC(delay_ms), K_NO_WAIT);
+    data->retry_delay_ms = MIN(delay_ms * 2U, MOTION_RETRY_MAX_DELAY_MS);
+}
+
+static void paw32xx_resubmit_if_motion(struct paw32xx_data *data) {
+    data->retry_delay_ms = MOTION_RETRY_MIN_DELAY_MS;
+
+    if (!atomic_get(&data->suspended) && paw32xx_motion_pin_get(data) > 0) {
+        k_work_submit(&data->motion_work);
+    }
+}
+
+static void paw32xx_report_pending(struct paw32xx_data *data) {
+    int32_t x = data->pending_x;
+    int32_t y = data->pending_y;
+
+    data->pending_x = 0;
+    data->pending_y = 0;
+
+    input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
+    input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);
+}
+
+static void paw32xx_report_work_handler(struct k_work *work) {
+    struct k_work_delayable *delayable = k_work_delayable_from_work(work);
+    struct paw32xx_data *data = CONTAINER_OF(delayable, struct paw32xx_data, report_work);
+
+    if (!atomic_get(&data->suspended)) {
+        paw32xx_report_pending(data);
+    }
+}
+
+static void paw32xx_report_motion(struct paw32xx_data *data, int16_t x, int16_t y) {
+    const struct paw32xx_config *cfg = data->dev->config;
+
+    if (cfg->report_interval_ms == 0U) {
+        input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
+        input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);
+        return;
+    }
+
+    data->pending_x += x;
+    data->pending_y += y;
+
+    /* Keep the first deadline so continuous motion cannot postpone reporting. */
+    k_work_schedule(&data->report_work, K_MSEC(cfg->report_interval_ms));
 }
 
 static void paw32xx_motion_work_handler(struct k_work *work) {
     struct paw32xx_data *data = CONTAINER_OF(work, struct paw32xx_data, motion_work);
     const struct device *dev = data->dev;
-    const struct paw32xx_config *cfg = dev->config;
     uint8_t val;
     int16_t x, y;
     int ret;
 
+    if (atomic_get(&data->suspended)) {
+        return;
+    }
+
     ret = paw32xx_read_reg(dev, PAW32XX_MOTION, &val);
     if (ret < 0) {
+        if (data->retry_delay_ms == MOTION_RETRY_MIN_DELAY_MS) {
+            LOG_ERR("Failed to read motion status: %d", ret);
+        }
+        paw32xx_retry_if_motion(data);
         return;
     }
 
     if ((val & MOTION_STATUS_MOTION) == 0x00) {
-        // No motion detected, re-enable interrupts and wait for next interrupt
-        paw32xx_interrupt_enable(dev);
-
-        if (gpio_pin_get_dt(&cfg->irq_gpio) == 0) {
-            return;
-        }
+        /* Retry a GPIO/register race without slowing the normal motion path. */
+        paw32xx_retry_if_motion(data);
+        return;
     }
 
     ret = paw32xx_read_xy(dev, &x, &y);
     if (ret < 0) {
+        if (data->retry_delay_ms == MOTION_RETRY_MIN_DELAY_MS) {
+            LOG_ERR("Failed to read motion delta: %d", ret);
+        }
+        paw32xx_retry_if_motion(data);
         return;
     }
 
     LOG_DBG("x=%4d y=%4d", x, y);
 
-    input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
-    input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);
+    paw32xx_report_motion(data, x, y);
 
-    // Schedule next check after 15ms without using interrupts
-    k_timer_start(&data->motion_timer, K_MSEC(15), K_NO_WAIT);
+    /* Drain all pending samples without the former fixed 15 ms delay. */
+    paw32xx_resubmit_if_motion(data);
 }
 
 static void paw32xx_motion_handler(const struct device *gpio_dev, struct gpio_callback *cb,
                                    uint32_t pins) {
     struct paw32xx_data *data = CONTAINER_OF(cb, struct paw32xx_data, motion_cb);
-    const struct device *dev = data->dev;
 
     ARG_UNUSED(gpio_dev);
     ARG_UNUSED(pins);
 
-    // Disable interrupts while timer is active
-    paw32xx_interrupt_disable(dev);
+    if (atomic_get(&data->suspended)) {
+        return;
+    }
 
-    // Cancel any pending timer
-    k_timer_stop(&data->motion_timer);
-
-    // Process motion
+    k_timer_stop(&data->motion_retry_timer);
+    data->retry_delay_ms = MOTION_RETRY_MIN_DELAY_MS;
     k_work_submit(&data->motion_work);
 }
 
@@ -439,10 +521,12 @@ static int paw32xx_init(const struct device *dev) {
     }
 
     data->dev = dev;
+    atomic_clear(&data->suspended);
+    data->retry_delay_ms = MOTION_RETRY_MIN_DELAY_MS;
 
     k_work_init(&data->motion_work, paw32xx_motion_work_handler);
-    // Initialize the timer for delayed motion checks
-    k_timer_init(&data->motion_timer, paw32xx_motion_timer_handler, NULL);
+    k_work_init_delayable(&data->report_work, paw32xx_report_work_handler);
+    k_timer_init(&data->motion_retry_timer, paw32xx_motion_retry_timer_handler, NULL);
 
 #if DT_INST_NODE_HAS_PROP(0, power_gpios)
     // Initialize power GPIO if defined
@@ -525,15 +609,21 @@ static int paw32xx_init(const struct device *dev) {
 #ifdef CONFIG_PM_DEVICE
 static int paw32xx_pm_action(const struct device *dev, enum pm_device_action action) {
     const struct paw32xx_config *cfg = dev->config;
+    struct paw32xx_data *data = dev->data;
     int ret;
     uint8_t val;
 
     switch (action) {
     case PM_DEVICE_ACTION_SUSPEND:
+        atomic_set(&data->suspended, 1);
+        k_timer_stop(&data->motion_retry_timer);
+        k_work_cancel_delayable(&data->report_work);
+
         // Disable IRQ interrupt
         ret = paw32xx_interrupt_disable(dev);
         if (ret < 0) {
             LOG_ERR("Failed to disable IRQ interrupt: %d", ret);
+            atomic_clear(&data->suspended);
             return ret;
         }
 
@@ -541,12 +631,14 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         ret = gpio_pin_configure_dt(&cfg->irq_gpio, GPIO_DISCONNECTED);
         if (ret < 0) {
             LOG_ERR("Failed to disconnect IRQ GPIO: %d", ret);
+            atomic_clear(&data->suspended);
             return ret;
         }
 
         val = CONFIGURATION_PD_ENH;
         ret = paw32xx_update_reg(dev, PAW32XX_CONFIGURATION, CONFIGURATION_PD_ENH, val);
         if (ret < 0) {
+            atomic_clear(&data->suspended);
             return ret;
         }
 
@@ -573,6 +665,13 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
             LOG_ERR("Failed to enable IRQ interrupt: %d", ret);
             return ret;
         }
+
+        /* An asserted level during resume may not produce a new edge. */
+        atomic_clear(&data->suspended);
+        if (data->pending_x != 0 || data->pending_y != 0) {
+            k_work_schedule(&data->report_work, K_NO_WAIT);
+        }
+        paw32xx_resubmit_if_motion(data);
         break;
 
     default:
@@ -596,6 +695,7 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         .power_gpio = GPIO_DT_SPEC_INST_GET_OR(n, power_gpios, {0}),                               \
         .res_cpi = DT_INST_PROP_OR(n, res_cpi, -1),                                                \
         .force_awake = DT_INST_PROP(n, force_awake),                                               \
+        .report_interval_ms = DT_INST_PROP(n, report_interval_ms),                                 \
     };                                                                                             \
                                                                                                    \
     static struct paw32xx_data paw32xx_data_##n;                                                   \
