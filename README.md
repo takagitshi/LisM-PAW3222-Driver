@@ -1,4 +1,9 @@
-# ZMK PAW3222 Driver
+# LisM PAW3222 Driver
+
+> [!IMPORTANT]
+> **このリポジトリはLisMの内部依存ドライバで、通常は直接編集しません。**
+> 普段のキーマップ、レイヤー、ビルド設定、ファームウェア変更は
+> [`LisM-ZMK-Firmware`](https://github.com/takagitshi/LisM-ZMK-Firmware)で行います。
 
 This driver enables the use of the PIXART PAW3222 optical sensor with the ZMK framework.
 
