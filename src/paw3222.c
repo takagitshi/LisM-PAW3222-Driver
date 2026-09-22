@@ -22,8 +22,15 @@
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/util.h>
 
+#if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+#include <zmk/keymap.h>
+#endif
+
 #include "../include/paw3222.h"
 #include "../include/paw3222_delta.h"
+#if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+#include "../include/paw3222_pointer_acceleration.h"
+#endif
 
 LOG_MODULE_REGISTER(paw32xx, CONFIG_ZMK_LOG_LEVEL);
 
@@ -76,6 +83,12 @@ struct paw32xx_config {
     int16_t res_cpi;
     bool force_awake;
     uint32_t report_interval_ms;
+#if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+    bool pointer_acceleration_enabled;
+    uint8_t pointer_acceleration_scroll_layer;
+    uint8_t pointer_acceleration_gesture_layer;
+    struct paw3222_pointer_accel_curve pointer_acceleration_curve;
+#endif
 };
 
 struct paw32xx_data {
@@ -88,6 +101,11 @@ struct paw32xx_data {
     uint8_t retry_delay_ms;
     int32_t pending_x;
     int32_t pending_y;
+#if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+    int64_t pending_start_time_ms;
+    bool have_pending_start;
+    struct paw3222_pointer_accel_state pointer_acceleration;
+#endif
 };
 
 #if DT_INST_NODE_HAS_PROP(0, power_gpios)
@@ -291,11 +309,37 @@ static void paw32xx_resubmit_if_motion(struct paw32xx_data *data) {
 }
 
 static void paw32xx_report_pending(struct paw32xx_data *data) {
+#if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+    const struct paw32xx_config *cfg = data->dev->config;
+    const int64_t now_ms = k_uptime_get();
+#endif
     int32_t x = data->pending_x;
     int32_t y = data->pending_y;
 
     data->pending_x = 0;
     data->pending_y = 0;
+
+#if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+    const int64_t collection_elapsed_ms =
+        data->have_pending_start ? now_ms - data->pending_start_time_ms : 0;
+    data->pending_start_time_ms = 0;
+    data->have_pending_start = false;
+
+    if (cfg->pointer_acceleration_enabled) {
+        bool bypass = true;
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+        bypass = zmk_keymap_layer_active(cfg->pointer_acceleration_scroll_layer) ||
+                 zmk_keymap_layer_active(cfg->pointer_acceleration_gesture_layer);
+#endif
+        if (bypass) {
+            paw3222_pointer_accel_reset(&data->pointer_acceleration);
+        } else {
+            paw3222_pointer_accel_apply_frame(
+                &cfg->pointer_acceleration_curve, &data->pointer_acceleration, x, y,
+                now_ms, collection_elapsed_ms, &x, &y);
+        }
+    }
+#endif
 
     input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
     input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);
@@ -319,8 +363,20 @@ static void paw32xx_report_motion(struct paw32xx_data *data, int16_t x, int16_t 
         return;
     }
 
+#if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+    if (!data->have_pending_start && (x != 0 || y != 0)) {
+        data->pending_start_time_ms = k_uptime_get();
+        data->have_pending_start = true;
+    }
+#endif
     data->pending_x += x;
     data->pending_y += y;
+#if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+    if (data->pending_x == 0 && data->pending_y == 0) {
+        data->pending_start_time_ms = 0;
+        data->have_pending_start = false;
+    }
+#endif
 
     /* Keep the first deadline so continuous motion cannot postpone reporting. */
     k_work_schedule(&data->report_work, K_MSEC(cfg->report_interval_ms));
@@ -523,6 +579,9 @@ static int paw32xx_init(const struct device *dev) {
     data->dev = dev;
     atomic_clear(&data->suspended);
     data->retry_delay_ms = MOTION_RETRY_MIN_DELAY_MS;
+#if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+    paw3222_pointer_accel_reset(&data->pointer_acceleration);
+#endif
 
     k_work_init(&data->motion_work, paw32xx_motion_work_handler);
     k_work_init_delayable(&data->report_work, paw32xx_report_work_handler);
@@ -618,6 +677,9 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         atomic_set(&data->suspended, 1);
         k_timer_stop(&data->motion_retry_timer);
         k_work_cancel_delayable(&data->report_work);
+#if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+        paw3222_pointer_accel_reset(&data->pointer_acceleration);
+#endif
 
         // Disable IRQ interrupt
         ret = paw32xx_interrupt_disable(dev);
@@ -669,6 +731,10 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         /* An asserted level during resume may not produce a new edge. */
         atomic_clear(&data->suspended);
         if (data->pending_x != 0 || data->pending_y != 0) {
+#if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+            data->pending_start_time_ms = k_uptime_get();
+            data->have_pending_start = true;
+#endif
             k_work_schedule(&data->report_work, K_NO_WAIT);
         }
         paw32xx_resubmit_if_motion(data);
@@ -685,9 +751,93 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
 #define PAW32XX_SPI_MODE                                                                           \
     (SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_MODE_CPOL | SPI_MODE_CPHA | SPI_TRANSFER_MSB)
 
+#if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+#define PAW32XX_POINTER_ACCEL_ASSERTS(n)                                                           \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, report_interval_ms) > 0,                                      \
+                 "pointer acceleration requires a non-zero report interval");                    \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_base_gain_milli) > 0,                    \
+                 "pointer acceleration base gain must be positive");                             \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_base_gain_milli) <= 4000,               \
+                 "pointer acceleration base gain must not exceed 4.0x");                         \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_base_gain_milli) <=                      \
+                         DT_INST_PROP(n, pointer_acceleration_max_gain_milli),                     \
+                 "pointer acceleration base gain exceeds max gain");                             \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_max_gain_milli) <= 4000,                \
+                 "pointer acceleration max gain must not exceed 4.0x");                          \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_takeoff_speed) >= 0,                    \
+                 "pointer acceleration takeoff speed must not be negative");                     \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_takeoff_speed) <                        \
+                         DT_INST_PROP(n, pointer_acceleration_full_speed),                         \
+                 "pointer acceleration takeoff must be below full speed");                       \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_full_speed) <= UINT16_MAX,              \
+                 "pointer acceleration speeds must fit in 16 bits");                             \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_reference_interval_ms) > 0,             \
+                 "pointer acceleration reference interval must be positive");                    \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_reference_interval_ms) <= UINT16_MAX,   \
+                 "pointer acceleration reference interval must fit in 16 bits");                 \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_idle_reset_ms) >                        \
+                         DT_INST_PROP(n, pointer_acceleration_reference_interval_ms),             \
+                 "pointer acceleration idle reset must exceed the reference interval");          \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_idle_reset_ms) <= UINT16_MAX,           \
+                 "pointer acceleration idle reset must fit in 16 bits");                         \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_scroll_layer) >= 0,                     \
+                 "pointer acceleration Scroll layer must not be negative");                      \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_scroll_layer) <= UINT8_MAX,             \
+                 "pointer acceleration Scroll layer must fit in 8 bits");                        \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_scroll_layer) <                         \
+                         ZMK_KEYMAP_LAYERS_LEN,                                                   \
+                 "pointer acceleration Scroll layer must exist");                               \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_gesture_layer) >= 0,                    \
+                 "pointer acceleration Gesture layer must not be negative");                     \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_gesture_layer) <= UINT8_MAX,            \
+                 "pointer acceleration Gesture layer must fit in 8 bits");                       \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_gesture_layer) <                        \
+                         ZMK_KEYMAP_LAYERS_LEN,                                                   \
+                 "pointer acceleration Gesture layer must exist")
+
+#define PAW32XX_POINTER_ACCEL_CONFIG(n)                                                            \
+    .pointer_acceleration_enabled = DT_INST_PROP(n, pointer_acceleration),                         \
+    .pointer_acceleration_scroll_layer =                                                           \
+        DT_INST_PROP(n, pointer_acceleration_scroll_layer),                                        \
+    .pointer_acceleration_gesture_layer =                                                          \
+        DT_INST_PROP(n, pointer_acceleration_gesture_layer),                                       \
+    .pointer_acceleration_curve =                                                                  \
+        {                                                                                          \
+            .base_gain_milli = DT_INST_PROP(n, pointer_acceleration_base_gain_milli),              \
+            .takeoff_speed = DT_INST_PROP(n, pointer_acceleration_takeoff_speed),                  \
+            .full_speed = DT_INST_PROP(n, pointer_acceleration_full_speed),                        \
+            .max_gain_milli = DT_INST_PROP(n, pointer_acceleration_max_gain_milli),                \
+            .reference_interval_ms =                                                              \
+                DT_INST_PROP(n, pointer_acceleration_reference_interval_ms),                       \
+            .idle_reset_ms = DT_INST_PROP(n, pointer_acceleration_idle_reset_ms),                  \
+        },
+#else
+#define PAW32XX_POINTER_ACCEL_ASSERTS(n)
+#define PAW32XX_POINTER_ACCEL_CONFIG(n)
+#endif
+
 #define PAW32XX_INIT(n)                                                                            \
     BUILD_ASSERT(IN_RANGE(DT_INST_PROP_OR(n, res_cpi, RES_MIN), RES_MIN, RES_MAX),                 \
                  "invalid res-cpi");                                                               \
+    PAW32XX_POINTER_ACCEL_ASSERTS(n);                                                              \
                                                                                                    \
     static const struct paw32xx_config paw32xx_cfg_##n = {                                         \
         .spi = SPI_DT_SPEC_INST_GET(n, PAW32XX_SPI_MODE, 0),                                       \
@@ -696,6 +846,7 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         .res_cpi = DT_INST_PROP_OR(n, res_cpi, -1),                                                \
         .force_awake = DT_INST_PROP(n, force_awake),                                               \
         .report_interval_ms = DT_INST_PROP(n, report_interval_ms),                                 \
+        PAW32XX_POINTER_ACCEL_CONFIG(n)                                                            \
     };                                                                                             \
                                                                                                    \
     static struct paw32xx_data paw32xx_data_##n;                                                   \

@@ -41,3 +41,50 @@ properties:
       Aggregate deltas and report them at most once per interval. Zero reports
       every sample immediately. A small non-zero interval is useful on split
       peripherals whose transport has bounded notification buffers.
+
+  pointer-acceleration:
+    type: boolean
+    description: |
+      Apply the configured vector-based gain curve to each complete X/Y report
+      frame. This requires a non-zero report-interval-ms and is intended for a
+      central device that can evaluate the bypass layers.
+
+  pointer-acceleration-base-gain-milli:
+    type: int
+    default: 1000
+    description: Low-speed gain in thousandths.
+
+  pointer-acceleration-takeoff-speed:
+    type: int
+    default: 16
+    description: Vector speed at or below which the base gain is used.
+
+  pointer-acceleration-full-speed:
+    type: int
+    default: 80
+    description: Vector speed at which the gain transition reaches its full slope.
+
+  pointer-acceleration-max-gain-milli:
+    type: int
+    default: 3000
+    description: Maximum high-speed gain in thousandths.
+
+  pointer-acceleration-reference-interval-ms:
+    type: int
+    default: 8
+    description: Report interval used to normalize genuinely delayed frames.
+
+  pointer-acceleration-idle-reset-ms:
+    type: int
+    default: 60
+    description: Idle duration that clears fractional carry state.
+
+  pointer-acceleration-scroll-layer:
+    type: int
+    default: 2
+    description: Layer on which acceleration is bypassed for raw scrolling.
+
+  pointer-acceleration-gesture-layer:
+    type: int
+    default: 3
+    description: Layer on which acceleration is bypassed for raw gestures.

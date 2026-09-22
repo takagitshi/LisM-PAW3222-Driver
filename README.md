@@ -97,6 +97,9 @@ endif
 - `force-awake`: Initialize the sensor in "force awake" mode (optional, boolean)
 - `report-interval-ms`: Aggregate deltas and report at most once per interval
   (optional, defaults to immediate reporting)
+- `pointer-acceleration`: Apply an optional same-frame vector gain curve at the
+  report aggregation point. The tuning properties use the
+  `pointer-acceleration-*` prefix.
 
 ## Motion sampling
 
@@ -112,6 +115,12 @@ sent as one X/Y frame per interval so a bounded split transport is not flooded.
 `force-awake` remains disabled by default because it trades lower wake latency
 for higher battery use. Enable it only when comparing first-motion wake latency
 on the target hardware.
+
+Pointer acceleration is opt-in per sensor node. It scales a complete X/Y frame
+with one shared gain, retains fractional motion, and normalizes only genuine
+collection backlog. The configured Scroll and Gesture layers bypass the curve.
+For a split keyboard, enable it on a central sensor only; a peripheral cannot
+observe the central keymap layer state and therefore keeps the raw path.
 
 ---
 
