@@ -9,7 +9,7 @@ if PAW3222
 
 config PAW3222_POINTER_ACCELERATION
     bool "PAW3222 same-frame pointer acceleration support"
-    default y
+    default n
     help
       Allow an opted-in PAW3222 node to apply a vector-based gain curve to
       each complete X/Y report frame. Nodes without the Devicetree opt-in keep

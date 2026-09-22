@@ -29,6 +29,7 @@
 #include "../include/paw3222.h"
 #include "../include/paw3222_delta.h"
 #if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+#include "../include/paw3222_output.h"
 #include "../include/paw3222_pointer_acceleration.h"
 #endif
 
@@ -105,6 +106,7 @@ struct paw32xx_data {
     int64_t pending_start_time_ms;
     bool have_pending_start;
     struct paw3222_pointer_accel_state pointer_acceleration;
+    struct paw3222_output_state output;
 #endif
 };
 
@@ -312,33 +314,88 @@ static void paw32xx_report_pending(struct paw32xx_data *data) {
 #if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
     const struct paw32xx_config *cfg = data->dev->config;
     const int64_t now_ms = k_uptime_get();
+    if (cfg->pointer_acceleration_enabled) {
+        const bool draining_output = paw3222_output_has_pending(&data->output);
+
+        if (!draining_output) {
+            int32_t x = data->pending_x;
+            int32_t y = data->pending_y;
+            const int64_t collection_elapsed_ms =
+                data->have_pending_start ? now_ms - data->pending_start_time_ms : 0;
+
+            if (x == 0 && y == 0) {
+                return;
+            }
+
+            data->pending_x = 0;
+            data->pending_y = 0;
+            data->pending_start_time_ms = 0;
+            data->have_pending_start = false;
+
+            bool bypass = true;
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+            bypass = zmk_keymap_layer_active(cfg->pointer_acceleration_scroll_layer) ||
+                     zmk_keymap_layer_active(cfg->pointer_acceleration_gesture_layer);
 #endif
+            if (bypass) {
+                paw3222_pointer_accel_reset(&data->pointer_acceleration);
+            } else {
+                paw3222_pointer_accel_apply_frame(
+                    &cfg->pointer_acceleration_curve, &data->pointer_acceleration, x, y,
+                    now_ms, collection_elapsed_ms, &x, &y);
+            }
+            paw3222_output_queue(&data->output, x, y, true);
+        }
+
+        const struct paw3222_output_frame frame =
+            paw3222_output_take_next(&data->output);
+        const bool have_x = frame.x != 0;
+        const bool have_y = frame.y != 0;
+        int x_err = 0;
+        int y_err = 0;
+
+        if (!have_x && !have_y && frame.force_sync) {
+            x_err = input_report_rel(data->dev, INPUT_REL_X, 0, true, K_NO_WAIT);
+        } else if (have_x) {
+            x_err = input_report_rel(data->dev, INPUT_REL_X, frame.x, !have_y, K_NO_WAIT);
+        }
+
+        struct paw3222_frame_retry retry =
+            paw3222_frame_retry_result(frame.x, frame.y, x_err, 0);
+        if (retry.send_y) {
+            y_err = input_report_rel(data->dev, INPUT_REL_Y, frame.y, true, K_NO_WAIT);
+            retry = paw3222_frame_retry_result(frame.x, frame.y, x_err, y_err);
+        }
+
+        const bool zero_sync_failed =
+            frame.force_sync && !have_x && !have_y && x_err < 0;
+        paw3222_output_complete(&data->output, retry, zero_sync_failed);
+        const bool have_output = paw3222_output_has_pending(&data->output);
+
+        if (retry.x != 0 || retry.y != 0 || zero_sync_failed) {
+            LOG_WRN("PAW3222 input report failed; retaining delta (%d, %d)", x_err,
+                    y_err);
+        }
+
+        if (have_output || data->pending_x != 0 || data->pending_y != 0) {
+            int ret = k_work_reschedule(&data->report_work,
+                                        K_MSEC(cfg->report_interval_ms));
+            if (ret < 0) {
+                LOG_ERR("Failed to reschedule PAW3222 report: %d", ret);
+            }
+        }
+        return;
+    }
+#endif
+
     int32_t x = data->pending_x;
     int32_t y = data->pending_y;
 
     data->pending_x = 0;
     data->pending_y = 0;
-
 #if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
-    const int64_t collection_elapsed_ms =
-        data->have_pending_start ? now_ms - data->pending_start_time_ms : 0;
     data->pending_start_time_ms = 0;
     data->have_pending_start = false;
-
-    if (cfg->pointer_acceleration_enabled) {
-        bool bypass = true;
-#if IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-        bypass = zmk_keymap_layer_active(cfg->pointer_acceleration_scroll_layer) ||
-                 zmk_keymap_layer_active(cfg->pointer_acceleration_gesture_layer);
-#endif
-        if (bypass) {
-            paw3222_pointer_accel_reset(&data->pointer_acceleration);
-        } else {
-            paw3222_pointer_accel_apply_frame(
-                &cfg->pointer_acceleration_curve, &data->pointer_acceleration, x, y,
-                now_ms, collection_elapsed_ms, &x, &y);
-        }
-    }
 #endif
 
     input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
@@ -581,6 +638,7 @@ static int paw32xx_init(const struct device *dev) {
     data->retry_delay_ms = MOTION_RETRY_MIN_DELAY_MS;
 #if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
     paw3222_pointer_accel_reset(&data->pointer_acceleration);
+    paw3222_output_init(&data->output);
 #endif
 
     k_work_init(&data->motion_work, paw32xx_motion_work_handler);
@@ -730,11 +788,17 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
 
         /* An asserted level during resume may not produce a new edge. */
         atomic_clear(&data->suspended);
-        if (data->pending_x != 0 || data->pending_y != 0) {
 #if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+        if (data->pending_x != 0 || data->pending_y != 0) {
             data->pending_start_time_ms = k_uptime_get();
             data->have_pending_start = true;
+        }
 #endif
+        if (data->pending_x != 0 || data->pending_y != 0
+#if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+            || paw3222_output_has_pending(&data->output)
+#endif
+        ) {
             k_work_schedule(&data->report_work, K_NO_WAIT);
         }
         paw32xx_resubmit_if_motion(data);
@@ -799,6 +863,9 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
                      DT_INST_PROP(n, pointer_acceleration_scroll_layer) <= UINT8_MAX,             \
                  "pointer acceleration Scroll layer must fit in 8 bits");                        \
     BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_scroll_layer) < 32,                     \
+                 "pointer acceleration Scroll layer must fit the active-layer mask");           \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
                      DT_INST_PROP(n, pointer_acceleration_scroll_layer) <                         \
                          ZMK_KEYMAP_LAYERS_LEN,                                                   \
                  "pointer acceleration Scroll layer must exist");                               \
@@ -808,6 +875,9 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
     BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
                      DT_INST_PROP(n, pointer_acceleration_gesture_layer) <= UINT8_MAX,            \
                  "pointer acceleration Gesture layer must fit in 8 bits");                       \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     DT_INST_PROP(n, pointer_acceleration_gesture_layer) < 32,                    \
+                 "pointer acceleration Gesture layer must fit the active-layer mask");          \
     BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
                      DT_INST_PROP(n, pointer_acceleration_gesture_layer) <                        \
                          ZMK_KEYMAP_LAYERS_LEN,                                                   \
@@ -837,6 +907,9 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
 #define PAW32XX_INIT(n)                                                                            \
     BUILD_ASSERT(IN_RANGE(DT_INST_PROP_OR(n, res_cpi, RES_MIN), RES_MIN, RES_MAX),                 \
                  "invalid res-cpi");                                                               \
+    BUILD_ASSERT(IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION) ||                                \
+                     !DT_INST_PROP(n, pointer_acceleration),                                      \
+                 "pointer-acceleration requires CONFIG_PAW3222_POINTER_ACCELERATION");            \
     PAW32XX_POINTER_ACCEL_ASSERTS(n);                                                              \
                                                                                                    \
     static const struct paw32xx_config paw32xx_cfg_##n = {                                         \

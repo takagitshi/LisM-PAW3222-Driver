@@ -9,8 +9,8 @@
 
 static const struct paw3222_pointer_accel_curve lism_curve = {
     .base_gain_milli = 1000,
-    .takeoff_speed = 15,
-    .full_speed = 73,
+    .takeoff_speed = 17,
+    .full_speed = 85,
     .max_gain_milli = 3000,
     .reference_interval_ms = 8,
     .idle_reset_ms = 60,
@@ -51,7 +51,7 @@ static uint64_t output_speed_units(const struct paw3222_pointer_accel_curve *cur
 
 static void test_curve_is_monotonic_and_bounded(void) {
     assert(paw3222_pointer_accel_multiplier(&lism_curve, 0) == 1000000);
-    assert(paw3222_pointer_accel_multiplier(&lism_curve, 15) == 1000000);
+    assert(paw3222_pointer_accel_multiplier(&lism_curve, 17) == 1000000);
 
     uint32_t previous = 1000000;
     uint64_t previous_output = output_speed_units(&lism_curve, 0);
@@ -67,7 +67,7 @@ static void test_curve_is_monotonic_and_bounded(void) {
         previous = current;
         previous_output = current_output;
     }
-    assert(previous >= 2999000);
+    assert(previous == 2998980);
 }
 
 static void test_fractional_motion_reversal_and_idle_reset(void) {
