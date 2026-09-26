@@ -99,7 +99,9 @@ endif
   (optional, defaults to immediate reporting)
 - `pointer-acceleration`: Apply an optional same-frame vector gain curve at the
   report aggregation point. The tuning properties use the
-  `pointer-acceleration-*` prefix.
+  `pointer-acceleration-*` prefix. A second raw Gesture layer can be set with
+  `pointer-acceleration-gesture-layer-2`; when omitted, it defaults to the
+  primary Gesture layer.
 
 ## Motion sampling
 
@@ -118,7 +120,8 @@ on the target hardware.
 
 Pointer acceleration is opt-in per sensor node. It scales a complete X/Y frame
 with one shared gain, retains fractional motion, and normalizes only genuine
-collection backlog. The configured Scroll and Gesture layers bypass the curve.
+collection backlog. The configured Scroll and up to two Gesture layers bypass
+the curve.
 For a split keyboard, enable it on a central sensor only; a peripheral cannot
 observe the central keymap layer state and therefore keeps the raw path.
 

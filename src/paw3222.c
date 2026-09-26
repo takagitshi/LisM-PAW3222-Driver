@@ -88,6 +88,7 @@ struct paw32xx_config {
     bool pointer_acceleration_enabled;
     uint8_t pointer_acceleration_scroll_layer;
     uint8_t pointer_acceleration_gesture_layer;
+    uint8_t pointer_acceleration_gesture_layer_2;
     struct paw3222_pointer_accel_curve pointer_acceleration_curve;
 #endif
 };
@@ -335,7 +336,8 @@ static void paw32xx_report_pending(struct paw32xx_data *data) {
             bool bypass = true;
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
             bypass = zmk_keymap_layer_active(cfg->pointer_acceleration_scroll_layer) ||
-                     zmk_keymap_layer_active(cfg->pointer_acceleration_gesture_layer);
+                     zmk_keymap_layer_active(cfg->pointer_acceleration_gesture_layer) ||
+                     zmk_keymap_layer_active(cfg->pointer_acceleration_gesture_layer_2);
 #endif
             if (bypass) {
                 paw3222_pointer_accel_reset(&data->pointer_acceleration);
@@ -816,6 +818,10 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
     (SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_MODE_CPOL | SPI_MODE_CPHA | SPI_TRANSFER_MSB)
 
 #if IS_ENABLED(CONFIG_PAW3222_POINTER_ACCELERATION)
+#define PAW32XX_GESTURE_LAYER_2(n)                                                               \
+    DT_INST_PROP_OR(n, pointer_acceleration_gesture_layer_2,                                     \
+                    DT_INST_PROP(n, pointer_acceleration_gesture_layer))
+
 #define PAW32XX_POINTER_ACCEL_ASSERTS(n)                                                           \
     BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
                      DT_INST_PROP(n, report_interval_ms) > 0,                                      \
@@ -881,7 +887,19 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
     BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
                      DT_INST_PROP(n, pointer_acceleration_gesture_layer) <                        \
                          ZMK_KEYMAP_LAYERS_LEN,                                                   \
-                 "pointer acceleration Gesture layer must exist")
+                 "pointer acceleration Gesture layer must exist");                              \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     PAW32XX_GESTURE_LAYER_2(n) >= 0,                                             \
+                 "pointer acceleration Gesture layer 2 must not be negative");                   \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     PAW32XX_GESTURE_LAYER_2(n) <= UINT8_MAX,                                     \
+                 "pointer acceleration Gesture layer 2 must fit in 8 bits");                     \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     PAW32XX_GESTURE_LAYER_2(n) < 32,                                             \
+                 "pointer acceleration Gesture layer 2 must fit the active-layer mask");         \
+    BUILD_ASSERT(!DT_INST_PROP(n, pointer_acceleration) ||                                         \
+                     PAW32XX_GESTURE_LAYER_2(n) < ZMK_KEYMAP_LAYERS_LEN,                           \
+                 "pointer acceleration Gesture layer 2 must exist")
 
 #define PAW32XX_POINTER_ACCEL_CONFIG(n)                                                            \
     .pointer_acceleration_enabled = DT_INST_PROP(n, pointer_acceleration),                         \
@@ -889,6 +907,7 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         DT_INST_PROP(n, pointer_acceleration_scroll_layer),                                        \
     .pointer_acceleration_gesture_layer =                                                          \
         DT_INST_PROP(n, pointer_acceleration_gesture_layer),                                       \
+    .pointer_acceleration_gesture_layer_2 = PAW32XX_GESTURE_LAYER_2(n),                            \
     .pointer_acceleration_curve =                                                                  \
         {                                                                                          \
             .base_gain_milli = DT_INST_PROP(n, pointer_acceleration_base_gain_milli),              \
